@@ -1,6 +1,10 @@
 #!/usr/bin/env pwsh
 <#
 .VERSION
+    2026-11-18.5 - FIX AUTOMATICO: se il PC e' hybrid joined, ha il PRT, non e' iscritto a
+                   Intune e non ha MDM concorrenti, esegue deviceenroller.exe
+                   /c /AutoEnrollMDM e verifica l'esito (fino a 3 minuti). Disattivabile
+                   con -SoloDiagnosi. -Forza ora fa solo gpupdate prima dei controlli.
     2026-11-18.4 - il log va sul Desktop dell'utente collegato al PC anche quando
                    PowerShell e' elevato con un altro account amministrativo; tolti
                    i riferimenti al caso d'origine (script generico).
@@ -12,7 +16,8 @@
 
 .SYNOPSIS
     Diagnostica perche' un PC Windows hybrid joined (dominio horsa.local + Entra ID)
-    non risulta iscritto a Intune. Di default e' in SOLA LETTURA.
+    non risulta iscritto a Intune e, se le condizioni lo permettono, lo iscrive
+    (fix automatico con deviceenroller). Con -SoloDiagnosi non modifica nulla.
 
 .DESCRIPTION
     Raccoglie in un unico log tutti i controlli della catena
@@ -30,11 +35,14 @@
          con decodifica indicativa dei codici d'errore piu' comuni
       9. Altri agenti di gestione (ConfigMgr, ManageEngine Desktop Central, Meraki)
      10. Connettivita' verso gli endpoint Microsoft di registrazione
-     11. ESITO: diagnosi sintetica e prossimo passo
+     11. FIX AUTOMATICO: deviceenroller.exe /c /AutoEnrollMDM se il PC non e'
+         iscritto ma ha i requisiti (hybrid joined, PRT, nessun altro MDM, admin);
+         poi verifica iscrizione ed eventi 75/76 per al massimo 3 minuti
+     12. ESITO: diagnosi sintetica e prossimo passo
 
-    Con -Forza (unica parte che modifica qualcosa) esegue prima
-    `gpupdate /target:computer /force` e `deviceenroller.exe /c /AutoEnrollMDM`,
-    attende 90 secondi e poi fa i controlli.
+    Modifiche al PC: solo il fix automatico (sezione 11) e, con -Forza, un
+    `gpupdate /target:computer /force` prima dei controlli. Con -SoloDiagnosi lo
+    script e' in sola lettura.
 
     Va lanciato sul PC dell'utente, in PowerShell COME AMMINISTRATORE, possibilmente
     con la VPN collegata (senza domain controller raggiungibile le GPO non si
@@ -50,13 +58,21 @@
     Quanti giorni di eventi analizzare. Default 30.
 
 .PARAMETER Forza
-    Forza aggiornamento GPO e tentativo di iscrizione prima dei controlli.
+    Esegue gpupdate /target:computer /force prima dei controlli (utile se la GPO
+    di auto-enrollment non e' ancora arrivata). Richiede il domain controller
+    raggiungibile (VPN).
+
+.PARAMETER SoloDiagnosi
+    Non esegue il fix automatico: solo controlli, nessuna modifica.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\horsa-intune-diagnostic3.ps1
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\horsa-intune-diagnostic3.ps1 -Forza
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\horsa-intune-diagnostic3.ps1 -SoloDiagnosi
 
 .NOTES
     Output: <Desktop>\<HOSTNAME>-intune-<yyyyMMdd-HHmm>.log (prima riga = versione).
@@ -67,10 +83,11 @@
 param(
     [string]$OutDir = '',
     [int]$Giorni = 30,
-    [switch]$Forza
+    [switch]$Forza,
+    [switch]$SoloDiagnosi
 )
 
-$ScriptVersion = '2026-11-18.4'
+$ScriptVersion = '2026-11-18.5'
 $GpoNome       = 'MDM_AutoEnroll'
 $Dominio       = 'horsa.local'
 $ErrorActionPreference = 'Continue'
@@ -116,6 +133,11 @@ function Out-Section([string]$Titolo) {
 function Add-Esito([string]$Livello, [string]$Testo) {
     $Esito.Add(("[{0}] {1}" -f $Livello, $Testo))
 }
+function Get-IntuneEnrollment {
+    Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+        Where-Object { $_.ProviderID -eq 'MS DM Server' } | Select-Object -First 1
+}
 
 # Decodifica indicativa dei codici d'errore piu' frequenti nell'evento 76
 $CodiciNoti = @{
@@ -158,13 +180,6 @@ if ($Forza) {
     } else {
         Out-Log '> gpupdate /target:computer /force'
         (gpupdate /target:computer /force 2>&1) | ForEach-Object { Out-Log "  $_" }
-        $de = Join-Path $env:WINDIR 'System32\deviceenroller.exe'
-        if (Test-Path $de) {
-            Out-Log '> deviceenroller.exe /c /AutoEnrollMDM'
-            Start-Process -FilePath $de -ArgumentList '/c /AutoEnrollMDM' -Wait -NoNewWindow
-        }
-        Out-Log 'Attesa 90 secondi per il completamento...'
-        Start-Sleep -Seconds 90
     }
 }
 
@@ -356,7 +371,51 @@ foreach ($h in 'enrollment.manage.microsoft.com','login.microsoftonline.com','en
 }
 
 # ---------------------------------------------------------------------------
-Out-Section 'ESITO'
+Out-Section '11. FIX AUTOMATICO (iscrizione a Intune)'
+$intuneOra = Get-IntuneEnrollment
+if ($SoloDiagnosi) {
+    Out-Log 'Non eseguito: richiesto -SoloDiagnosi.'
+} elseif ($intuneOra -and $intuneOra.EnrollmentState -eq 1) {
+    Out-Log 'Non necessario: il PC e'' gia'' iscritto a Intune.'
+} elseif (-not $isAdmin) {
+    Out-Log 'Non eseguito: servono privilegi di amministratore.'
+    Add-Esito 'ATTENZIONE' 'Fix automatico non eseguito: rilanciare lo script da PowerShell "Esegui come amministratore".'
+} elseif (-not $hybrid -or $dsv['AzureAdPrt'] -ne 'YES') {
+    Out-Log 'Non eseguito: il PC non e'' hybrid joined o manca il Primary Refresh Token (l''iscrizione fallirebbe).'
+    Add-Esito 'ATTENZIONE' 'Fix automatico non eseguibile: risolvere prima join/PRT (vedi sezione 2).'
+} elseif ($altriMdm) {
+    Out-Log 'Non eseguito: il PC e'' iscritto a un altro MDM, che va rimosso prima.'
+} else {
+    $de = Join-Path $env:WINDIR 'System32\deviceenroller.exe'
+    $t0 = Get-Date
+    Out-Log ("{0:yyyy-MM-dd HH:mm:ss} > {1} /c /AutoEnrollMDM" -f $t0, $de)
+    Start-Process -FilePath $de -ArgumentList '/c /AutoEnrollMDM' -Wait -NoNewWindow
+    Out-Log 'Verifica dell''iscrizione (al massimo 3 minuti)...'
+    $esitoFix = $null; $evFix = $null
+    for ($i = 0; $i -lt 18; $i++) {
+        Start-Sleep -Seconds 10
+        $nuovo = Get-IntuneEnrollment
+        if ($nuovo -and $nuovo.EnrollmentState -eq 1) { $esitoFix = 'OK'; break }
+        $evFix = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin'; StartTime = $t0; Id = 75, 76 } -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($evFix) { $esitoFix = if ($evFix.Id -eq 75) { 'OK' } else { 'KO' }; break }
+    }
+    if ($evFix) { Out-Log ("  evento {0}: {1}" -f $evFix.Id, (($evFix.Message -replace '\s+', ' ').Trim())) }
+    if ($esitoFix -eq 'OK') {
+        Out-Log '  Iscrizione a Intune RIUSCITA.'
+        Add-Esito 'OK' 'FIX AUTOMATICO RIUSCITO: il PC e'' stato iscritto a Intune e comparira'' nel portale entro qualche minuto. Gli eventuali KO sopra descrivono lo stato PRIMA del fix.'
+    } elseif ($esitoFix -eq 'KO') {
+        $codice = if ($evFix.Message -match '0x[0-9A-Fa-f]{8}') { $Matches[0].ToLower() } else { 'n/d' }
+        $spieg = if ($CodiciNoti.ContainsKey($codice)) { $CodiciNoti[$codice] } else { 'codice non in tabella.' }
+        Out-Log "  Iscrizione FALLITA, codice $codice."
+        Add-Esito 'KO' "FIX AUTOMATICO FALLITO, codice ${codice}: $spieg"
+    } else {
+        Out-Log '  Nessun esito entro 3 minuti.'
+        Add-Esito 'ATTENZIONE' 'FIX AUTOMATICO eseguito ma senza esito entro 3 minuti: ricontrollare Intune tra qualche minuto o rilanciare lo script con -SoloDiagnosi.'
+    }
+}
+
+# ---------------------------------------------------------------------------
+Out-Section '12. ESITO'
 $ordine = @{ '[KO]' = 0; '[ATTENZIONE]' = 1; '[OK]' = 2; '[INFO]' = 3 }
 foreach ($r in ($Esito | Sort-Object { $ordine[$_.Substring(0, $_.IndexOf(']') + 1)] })) { Out-Log "  $r" }
 Out-Log ''
