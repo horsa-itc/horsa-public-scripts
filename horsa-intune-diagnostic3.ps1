@@ -1,12 +1,14 @@
 #!/usr/bin/env pwsh
 <#
 .VERSION
+    2026-11-18.4 - il log va sul Desktop dell'utente collegato al PC anche quando
+                   PowerShell e' elevato con un altro account amministrativo; tolti
+                   i riferimenti al caso d'origine (script generico).
     2026-11-18.3 - il log si crea di default sul Desktop (prima C:\Temp\intune-diag).
     2026-11-18.2 - non segnala come MDM concorrenti le iscrizioni interne Microsoft
                    ("Microsoft Device Management", WMI_Bridge_SCCM_Server); ordine
                    dell'ESITO corretto (KO, ATTENZIONE, OK, INFO).
-    2026-11-18.1 - prima versione (caso LR90Z2NM6 / Antonia Dragoni: PC hybrid joined
-                   ma assente in Intune).
+    2026-11-18.1 - prima versione.
 
 .SYNOPSIS
     Diagnostica perche' un PC Windows hybrid joined (dominio horsa.local + Entra ID)
@@ -39,8 +41,10 @@
     aggiornano). Nessun dato viene inviato all'esterno: il log resta sul PC.
 
 .PARAMETER OutDir
-    Cartella del log. Default: il Desktop dell'utente che esegue lo script
-    (anche se reindirizzato su OneDrive).
+    Cartella del log. Default: il Desktop dell'utente collegato al PC (sessione
+    console), anche se PowerShell e' stato elevato con un altro account e anche
+    se il Desktop e' reindirizzato su OneDrive. Se non si riesce a determinarlo,
+    il Desktop dell'account che esegue lo script.
 
 .PARAMETER Giorni
     Quanti giorni di eventi analizzare. Default 30.
@@ -49,27 +53,49 @@
     Forza aggiornamento GPO e tentativo di iscrizione prima dei controlli.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\get-intune-enrollment-diagnostics.ps1
+    powershell -ExecutionPolicy Bypass -File .\horsa-intune-diagnostic3.ps1
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\get-intune-enrollment-diagnostics.ps1 -Forza
+    powershell -ExecutionPolicy Bypass -File .\horsa-intune-diagnostic3.ps1 -Forza
 
 .NOTES
     Output: <Desktop>\<HOSTNAME>-intune-<yyyyMMdd-HHmm>.log (prima riga = versione).
     Compatibile Windows PowerShell 5.1. Solo caratteri ASCII.
-    Catalogo: wiki/tools-index.md
+    Repo: https://github.com/horsa-itc/horsa-public-scripts
 #>
 [CmdletBinding()]
 param(
-    [string]$OutDir = [Environment]::GetFolderPath('Desktop'),
+    [string]$OutDir = '',
     [int]$Giorni = 30,
     [switch]$Forza
 )
 
-$ScriptVersion = '2026-11-18.3'
+$ScriptVersion = '2026-11-18.4'
 $GpoNome       = 'MDM_AutoEnroll'
 $Dominio       = 'horsa.local'
 $ErrorActionPreference = 'Continue'
+
+# Desktop dell'utente collegato al PC (non dell'account usato per l'elevazione)
+function Get-InteractiveDesktop {
+    try {
+        $u = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+        if (-not $u) { return $null }
+        $sid = (New-Object System.Security.Principal.NTAccount($u)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+        $prof = (Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction Stop).LocalPath
+        if (-not $prof) { return $null }
+        $desk = $null
+        $key = "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+        $raw = (Get-ItemProperty -Path $key -Name Desktop -ErrorAction SilentlyContinue).Desktop
+        if ($raw) { $desk = $raw -replace '%USERPROFILE%', $prof }
+        if (-not $desk -or $desk -match '%') { $desk = Join-Path $prof 'Desktop' }
+        if (Test-Path $desk) { return $desk }
+    } catch { }
+    return $null
+}
+if (-not $OutDir) {
+    $OutDir = Get-InteractiveDesktop
+    if (-not $OutDir) { $OutDir = [Environment]::GetFolderPath('Desktop') }
+}
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $LogFile = Join-Path $OutDir ("{0}-intune-{1}.log" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd-HHmm'))
@@ -106,7 +132,7 @@ $CodiciNoti = @{
 }
 
 # ---------------------------------------------------------------------------
-Out-Log "get-intune-enrollment-diagnostics.ps1 versione $ScriptVersion"
+Out-Log "horsa-intune-diagnostic3.ps1 versione $ScriptVersion"
 Out-Section '1. SISTEMA'
 $os = Get-CimInstance Win32_OperatingSystem
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -335,4 +361,4 @@ $ordine = @{ '[KO]' = 0; '[ATTENZIONE]' = 1; '[OK]' = 2; '[INFO]' = 3 }
 foreach ($r in ($Esito | Sort-Object { $ordine[$_.Substring(0, $_.IndexOf(']') + 1)] })) { Out-Log "  $r" }
 Out-Log ''
 Out-Log "Log salvato in: $LogFile"
-
+Out-Log 'Inviare questo file a service.horsa@horsa.it'
