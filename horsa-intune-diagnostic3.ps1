@@ -1,6 +1,7 @@
 #!/usr/bin/env pwsh
 <#
 .VERSION
+    2026-11-18.3 - il log si crea di default sul Desktop (prima C:\Temp\intune-diag).
     2026-11-18.2 - non segnala come MDM concorrenti le iscrizioni interne Microsoft
                    ("Microsoft Device Management", WMI_Bridge_SCCM_Server); ordine
                    dell'ESITO corretto (KO, ATTENZIONE, OK, INFO).
@@ -38,7 +39,8 @@
     aggiornano). Nessun dato viene inviato all'esterno: il log resta sul PC.
 
 .PARAMETER OutDir
-    Cartella del log. Default C:\Temp\intune-diag
+    Cartella del log. Default: il Desktop dell'utente che esegue lo script
+    (anche se reindirizzato su OneDrive).
 
 .PARAMETER Giorni
     Quanti giorni di eventi analizzare. Default 30.
@@ -53,18 +55,18 @@
     powershell -ExecutionPolicy Bypass -File .\get-intune-enrollment-diagnostics.ps1 -Forza
 
 .NOTES
-    Output: <OutDir>\<HOSTNAME>-intune-<yyyyMMdd-HHmm>.log (prima riga = versione).
+    Output: <Desktop>\<HOSTNAME>-intune-<yyyyMMdd-HHmm>.log (prima riga = versione).
     Compatibile Windows PowerShell 5.1. Solo caratteri ASCII.
     Catalogo: wiki/tools-index.md
 #>
 [CmdletBinding()]
 param(
-    [string]$OutDir = 'C:\Temp\intune-diag',
+    [string]$OutDir = [Environment]::GetFolderPath('Desktop'),
     [int]$Giorni = 30,
     [switch]$Forza
 )
 
-$ScriptVersion = '2026-11-18.2'
+$ScriptVersion = '2026-11-18.3'
 $GpoNome       = 'MDM_AutoEnroll'
 $Dominio       = 'horsa.local'
 $ErrorActionPreference = 'Continue'
@@ -333,4 +335,4 @@ $ordine = @{ '[KO]' = 0; '[ATTENZIONE]' = 1; '[OK]' = 2; '[INFO]' = 3 }
 foreach ($r in ($Esito | Sort-Object { $ordine[$_.Substring(0, $_.IndexOf(']') + 1)] })) { Out-Log "  $r" }
 Out-Log ''
 Out-Log "Log salvato in: $LogFile"
-Out-Log 'Inviare questo file a service.horsa@horsa.it'
+
